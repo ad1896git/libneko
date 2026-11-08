@@ -17,6 +17,15 @@ var TruncateOnStart = true
 var NB4AGuiLogWriter io.Writer
 
 func SetupLog(maxSize int, path string) (err error) {
+	if desktopLogPlatform && (neko_common.RunMode == neko_common.RunMode_NekoRay_Core ||
+		neko_common.RunMode == neko_common.RunMode_NekoBox_Core) {
+		return setupDesktopLog(maxSize, path)
+	}
+	return setupLegacyLog(maxSize, path)
+}
+
+// Keep non-desktop consumers on their existing logging path.
+func setupLegacyLog(maxSize int, path string) (err error) {
 	if LogWriter != nil {
 		return
 	}
@@ -106,7 +115,9 @@ func (w *logWriter) Truncate() {
 		if w == nil {
 			continue
 		}
-		if f, ok := w.(*os.File); ok {
+		if f, ok := w.(*desktopLogFile); ok {
+			f.truncate()
+		} else if f, ok := w.(*os.File); ok {
 			_ = f.Truncate(0)
 		}
 	}
@@ -117,7 +128,9 @@ func (w *logWriter) Close() error {
 		if w == nil {
 			continue
 		}
-		if f, ok := w.(*os.File); ok {
+		if f, ok := w.(*desktopLogFile); ok {
+			_ = f.Close()
+		} else if f, ok := w.(*os.File); ok {
 			_ = f.Close()
 		}
 	}
