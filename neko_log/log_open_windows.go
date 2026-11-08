@@ -67,76 +67,119 @@ func openDesktopLog(path string) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	sa := &windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: sd}
 
-	// Keep every ancestor open without write/delete sharing while traversing the
-	// absolute path. No component can be renamed/replaced between checks and
-	// opening the file, nor acquire a write handle to turn a checked directory
-	// into a reparse point. OPEN_REPARSE_POINT refuses existing reparse points.
-	var dirs []windows.Handle
-	defer func() {
-		for i := len(dirs) - 1; i >= 0; i-- {
-			_ = windows.CloseHandle(dirs[i])
-		}
-	}()
+	dirs, err := openLogAncestors(path, user.User.Sid)
+	defer closeLogAncestors(dirs)
+	if err != nil {
+		return nil, err
+	}
+	return openDesktopLogAt(dirs[len(dirs)-1], filepath.Base(path), path, user.User.Sid, sd)
+}
+
+func closeLogAncestors(dirs []windows.Handle) {
+	for i := len(dirs) - 1; i >= 0; i-- {
+		_ = windows.CloseHandle(dirs[i])
+	}
+}
+
+// The caller must close the returned handles even on error.
+func openLogAncestors(path string, sid *windows.SID) (dirs []windows.Handle, err error) {
+	// No delete sharing keeps these directory objects from being replaced.
+	// Attribute-only handles are NOT excluded by sharing: a checked directory
+	// can still become a junction. Relative single-component opens below keep
+	// using the original directory objects rather than resolving their paths.
+	volume := filepath.VolumeName(path)
 	parent := filepath.Dir(path)
 	parts := strings.Split(strings.TrimPrefix(parent[len(volume):], `\`), `\`)
-	current := volume + `\`
 	for i := -1; i < len(parts); i++ {
 		if i >= 0 {
 			if parts[i] == "" {
 				continue
 			}
 			if strings.TrimRight(parts[i], " .") != parts[i] {
-				return nil, fmt.Errorf("ambiguous log directory name")
+				return dirs, fmt.Errorf("ambiguous log directory name")
 			}
-			current = filepath.Join(current, parts[i])
 		}
-		name, err := windows.UTF16PtrFromString(current)
-		if err != nil {
-			return nil, err
+		var h windows.Handle
+		var err error
+		if len(dirs) == 0 {
+			// Only the drive root is opened by absolute path. Every later
+			// component is opened relative to its validated parent handle.
+			name, nameErr := windows.UTF16PtrFromString(volume + `\`)
+			if nameErr != nil {
+				return dirs, nameErr
+			}
+			h, err = windows.CreateFile(name, windows.FILE_READ_ATTRIBUTES|windows.READ_CONTROL|windows.FILE_TRAVERSE,
+				windows.FILE_SHARE_READ, nil, windows.OPEN_EXISTING,
+				windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+		} else {
+			h, err = openLogRelative(dirs[len(dirs)-1], parts[i],
+				windows.FILE_READ_ATTRIBUTES|windows.READ_CONTROL|windows.FILE_TRAVERSE,
+				windows.FILE_OPEN, windows.FILE_DIRECTORY_FILE, nil)
 		}
-		h, err := windows.CreateFile(name, windows.FILE_READ_ATTRIBUTES|windows.READ_CONTROL,
-			windows.FILE_SHARE_READ, nil, windows.OPEN_EXISTING,
-			windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
 		if err != nil {
-			return nil, err
+			return dirs, err
 		}
 		dirs = append(dirs, h)
 		var info windows.ByHandleFileInformation
 		if err = windows.GetFileInformationByHandle(h, &info); err != nil {
-			return nil, err
+			return dirs, err
 		}
 		if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
-			return nil, fmt.Errorf("log ancestor is not an ordinary directory")
+			return dirs, fmt.Errorf("log ancestor is not an ordinary directory")
 		}
 		security, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
 		if err != nil {
-			return nil, err
+			return dirs, err
 		}
 		owner, _, err := security.Owner()
 		if err != nil {
-			return nil, err
+			return dirs, err
 		}
 		if owner == nil {
-			return nil, fmt.Errorf("log ancestor has no owner")
+			return dirs, fmt.Errorf("log ancestor has no owner")
 		}
 		ownerSID := owner.String()
-		if !owner.Equals(user.User.Sid) && ownerSID != "S-1-5-18" && ownerSID != "S-1-5-32-544" && ownerSID != trustedInstallerSID {
-			return nil, fmt.Errorf("log ancestor has an untrusted owner")
+		if !owner.Equals(sid) && ownerSID != "S-1-5-18" && ownerSID != "S-1-5-32-544" && ownerSID != trustedInstallerSID {
+			return dirs, fmt.Errorf("log ancestor has an untrusted owner")
 		}
 	}
-	base := filepath.Base(path)
-	if strings.TrimRight(base, " .") != base {
-		return nil, fmt.Errorf("ambiguous log file name")
+	return dirs, nil
+}
+
+// openLogRelative opens exactly one child of a held directory. Never accept a
+// path here: FILE_OPEN_REPARSE_POINT protects only the final component.
+func openLogRelative(parent windows.Handle, name string, access, disposition, options uint32, sd *windows.SECURITY_DESCRIPTOR) (windows.Handle, error) {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `\/:`) || strings.TrimRight(name, " .") != name {
+		return windows.InvalidHandle, fmt.Errorf("log component must be a single unambiguous name")
 	}
-	name, err := windows.UTF16PtrFromString(path)
+	objectName, err := windows.NewNTUnicodeString(name)
 	if err != nil {
-		return nil, err
+		return windows.InvalidHandle, err
 	}
-	h, err := windows.CreateFile(name, windows.GENERIC_READ|windows.GENERIC_WRITE|windows.READ_CONTROL,
-		windows.FILE_SHARE_READ, sa, windows.OPEN_ALWAYS, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	attrs := windows.OBJECT_ATTRIBUTES{
+		RootDirectory:      parent,
+		ObjectName:         objectName,
+		Attributes:         windows.OBJ_CASE_INSENSITIVE | windows.OBJ_DONT_REPARSE,
+		SecurityDescriptor: sd,
+	}
+	attrs.Length = uint32(unsafe.Sizeof(attrs))
+	var h windows.Handle
+	var iosb windows.IO_STATUS_BLOCK
+	err = windows.NtCreateFile(&h, access|windows.SYNCHRONIZE, &attrs, &iosb, nil,
+		windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_SHARE_READ, disposition,
+		options|windows.FILE_OPEN_REPARSE_POINT|windows.FILE_SYNCHRONOUS_IO_NONALERT, 0, 0)
 	runtime.KeepAlive(sd)
+	if err != nil {
+		// Unsupported no-reparse semantics also fail closed; do not retry by path.
+		return windows.InvalidHandle, err
+	}
+	return h, nil
+}
+
+func openDesktopLogAt(parent windows.Handle, base, path string, sid *windows.SID, sd *windows.SECURITY_DESCRIPTOR) (*os.File, error) {
+	h, err := openLogRelative(parent, base, windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE,
+		windows.FILE_OPEN_IF, windows.FILE_NON_DIRECTORY_FILE, sd)
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +196,7 @@ func openDesktopLog(path string) (*os.File, error) {
 	if kind != windows.FILE_TYPE_DISK || info.FileAttributes&(windows.FILE_ATTRIBUTE_REPARSE_POINT|windows.FILE_ATTRIBUTE_DIRECTORY) != 0 || info.NumberOfLinks != 1 {
 		return fail(fmt.Errorf("log must be an ordinary file with one link, not a reparse point"))
 	}
-	if err = checkLogACL(h, user.User.Sid, sd); err != nil {
+	if err = checkLogACL(h, sid, sd); err != nil {
 		return fail(err)
 	}
 	return f, nil

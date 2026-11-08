@@ -23,7 +23,14 @@ remain usable. No alternate log path is selected automatically.
 - Windows accepts local drive paths and rejects alternate data streams and device
   or network namespaces. Each ancestor is opened with reparse-point semantics,
   checked for directory type and trusted ownership (current user, SYSTEM,
-  Administrators or TrustedInstaller), and held without write/delete sharing until the log is open.
+  Administrators or TrustedInstaller), and held without write/delete sharing until
+  the log is open. Sharing does not freeze directory attributes: all components
+  after the drive root, including the final log, are opened one name at a time
+  relative to the validated parent handle using `NtCreateFile`,
+  `OBJ_DONT_REPARSE` and `FILE_OPEN_REPARSE_POINT`. A directory converted to a
+  junction after validation therefore cannot redirect a later open by pathname;
+  it uses the original directory object or fails closed. Unsupported no-reparse
+  semantics also disable file logging rather than retrying by path.
   The file must be a non-reparse disk file with one link, owned by the current user,
   with a protected DACL containing only that user's full-control ACE. A new file
   receives that ACL at creation. Existing broader ACLs are refused, never changed.
