@@ -24,7 +24,7 @@ func openDesktopLog(path string) (*os.File, error) {
 		return nil, err
 	}
 	defer func() { _ = unix.Close(dir) }()
-	if err = checkDesktopACL(dir, true); err != nil {
+	if err = checkDesktopLogDirectory(dir); err != nil {
 		return nil, err
 	}
 	// Walk from the root using directory FDs, refusing symlinks in every
@@ -36,18 +36,8 @@ func openDesktopLog(path string) (*os.File, error) {
 		}
 		_ = unix.Close(dir)
 		dir = next
-		var st unix.Stat_t
-		if err = unix.Fstat(dir, &st); err != nil {
-			return nil, err
-		}
-		// Root-owned sticky directories (e.g. /tmp) cannot replace another
-		// user's entries. All other ancestors must disallow untrusted writes.
-		stickyRoot := st.Uid == 0 && st.Mode&unix.S_ISVTX != 0
-		if err = checkDesktopACL(dir, true); err != nil {
-			return nil, err
-		}
-		if (st.Uid != 0 && st.Uid != uint32(os.Geteuid())) || (st.Mode&0022 != 0 && !stickyRoot) {
-			return nil, fmt.Errorf("untrusted log directory: %s", part)
+		if err = checkDesktopLogDirectory(dir); err != nil {
+			return nil, fmt.Errorf("log ancestor %s: %w", part, err)
 		}
 	}
 	var parent unix.Stat_t
@@ -76,4 +66,21 @@ func openDesktopLog(path string) (*os.File, error) {
 		return nil, err
 	}
 	return f, nil
+}
+
+func checkDesktopLogDirectory(fd int) error {
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	if err := checkDesktopACL(fd, true); err != nil {
+		return err
+	}
+	// Root-owned sticky directories (e.g. /tmp) cannot replace another
+	// user's entries. All other ancestors must disallow untrusted writes.
+	stickyRoot := st.Uid == 0 && st.Mode&unix.S_ISVTX != 0
+	if (st.Uid != 0 && st.Uid != uint32(os.Geteuid())) || (st.Mode&0022 != 0 && !stickyRoot) {
+		return fmt.Errorf("directory must have a trusted owner and disallow untrusted writes")
+	}
+	return nil
 }
